@@ -38,3 +38,21 @@ export function getSessionRole(): Role | null {
   if (value === 'operador' || value === 'suporte') return value
   return null
 }
+
+/** Throws unless the current session is Suporte. Use in every Suporte-only server function. */
+export function requireSuporte(): Role {
+  const role = getSessionRole()
+  if (role !== 'suporte') {
+    throw new Error('Ação permitida apenas para o perfil Suporte.')
+  }
+  return role
+}
+
+/** Throws unless there is a logged-in session (any role). */
+export function requireSession(): Role {
+  const role = getSessionRole()
+  if (!role) {
+    throw new Error('Sessão expirada. Faça login novamente.')
+  }
+  return role
+}

@@ -3,7 +3,9 @@ import { useEffect, useState } from 'react'
 import { RotateCcw, Save, Sliders } from 'lucide-react'
 import { getSession } from '../server/auth.functions.js'
 import { getRanges, saveRanges, restoreDefaultRanges } from '../server/readings.functions.js'
+import { getMotors } from '../server/motors.functions.js'
 import { useToast } from '../components/Toast.js'
+import { MotorSelect, type Motor } from '../components/MotorSelect.js'
 import { VARIABLES, type RangesMap, type VariableKey } from '../lib/sensors.js'
 
 export const Route = createFileRoute('/_app/range')({
@@ -35,17 +37,31 @@ function RangePage() {
   const [form, setForm] = useState<FormState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  const [motors, setMotors] = useState<Motor[]>([])
+  const [motorId, setMotorId] = useState<number | null>(null)
 
   useEffect(() => {
-    getRanges().then((ranges) => setForm(toForm(ranges)))
+    getMotors().then((m) => {
+      setMotors(m)
+      if (m.length > 0) setMotorId(m[0].id)
+    })
   }, [])
+
+  useEffect(() => {
+    if (motorId === null) return
+    setForm(null)
+    setError(null)
+    getRanges({ data: { motorId } }).then((ranges) => setForm(toForm(ranges)))
+  }, [motorId])
+
+  const motorName = motors.find((m) => m.id === motorId)?.name ?? ''
 
   function updateField(key: VariableKey, field: 'min' | 'max' | 'attention', value: string) {
     setForm((prev) => (prev ? { ...prev, [key]: { ...prev[key], [field]: value } } : prev))
   }
 
   async function handleSave() {
-    if (!form) return
+    if (!form || motorId === null) return
     setError(null)
     setSaving(true)
     try {
@@ -57,9 +73,9 @@ function RangePage() {
           attention: Number(form[v.key].attention),
         }
       }
-      const updated = await saveRanges({ data: payload })
+      const updated = await saveRanges({ data: { motorId, ranges: payload } })
       setForm(toForm(updated))
-      showToast('Faixas salvas com sucesso.')
+      showToast(`Faixas do ${motorName} salvas com sucesso.`)
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Erro ao salvar faixas.'
       setError(message)
@@ -70,31 +86,48 @@ function RangePage() {
   }
 
   async function handleRestore() {
+    if (motorId === null) return
     setSaving(true)
     setError(null)
     try {
-      const restored = await restoreDefaultRanges()
+      const restored = await restoreDefaultRanges({ data: { motorId } })
       setForm(toForm(restored))
-      showToast('Faixas restauradas para o padrão.')
+      showToast(`Faixas do ${motorName} restauradas para o padrão.`)
     } finally {
       setSaving(false)
     }
   }
 
-  if (!form) {
-    return <div className="text-slate-500 text-sm">Carregando…</div>
-  }
-
-  return (
-    <div className="space-y-4 max-w-3xl">
+  const title = (
+    <>
       <div className="flex items-center gap-2">
         <Sliders className="w-5 h-5 text-sky-400" />
         <h1 className="text-lg font-bold text-slate-100">Range — Configuração de Limites</h1>
       </div>
       <p className="text-sm text-slate-500">
         Defina o mínimo, máximo e a faixa de atenção de cada variável monitorada. A faixa de
-        atenção deve ser menor que a metade do intervalo (mín–máx).
+        atenção deve ser menor que a metade do intervalo (mín–máx). Cada motor tem sua própria
+        configuração.
       </p>
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-slate-500 uppercase tracking-wide">Motor</span>
+        <MotorSelect motors={motors} value={motorId} onChange={(id) => id !== null && setMotorId(id)} />
+      </div>
+    </>
+  )
+
+  if (!form) {
+    return (
+      <div className="space-y-4 max-w-3xl">
+        {title}
+        <div className="text-slate-500 text-sm">Carregando…</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-4 max-w-3xl">
+      {title}
 
       {error && (
         <p className="text-sm text-red-400 bg-red-950/40 border border-red-900/50 rounded-lg px-3 py-2">
