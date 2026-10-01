@@ -47,3 +47,21 @@ export const logout = createServerFn({ method: 'POST' }).handler(async () => {
 export const getSession = createServerFn({ method: 'GET' }).handler(async () => {
   return { role: getSessionRole() }
 })
+
+const PageVisitSchema = z.object({ page: z.string().max(200) })
+
+/** Records which screen (aba) a logged-in user opened, for Histórico de Entradas. */
+export const logPageVisit = createServerFn({ method: 'POST' })
+  .inputValidator(PageVisitSchema)
+  .handler(async ({ data }) => {
+    const role = getSessionRole()
+    if (!role) return { success: false }
+    await db.insert(accessLogs).values({
+      userLabel: ROLE_LABEL[role],
+      role,
+      success: true,
+      event: 'page',
+      page: data.page,
+    })
+    return { success: true }
+  })

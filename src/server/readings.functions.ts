@@ -1,10 +1,12 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import { desc, eq } from 'drizzle-orm'
+import { and, asc, desc, eq } from 'drizzle-orm'
 import { db } from '../../db/index.js'
-import { readings, failures, ranges as rangesTable, accessLogs } from '../../db/schema.js'
-import { getRangesMap } from './db.server.js'
+import { readings, failures, motorRanges, accessLogs, motors } from '../../db/schema.js'
+import { clearRows, getMotorRangesMap } from './db.server.js'
+import { requireSession, requireSuporte } from './auth.server.js'
 import { simulateNext, initialReading } from './simulate.server.js'
+import { ClearSchema } from '../lib/clear.js'
 import {
   VARIABLES,
   computeStatus,
@@ -31,11 +33,13 @@ function statusesFor(reading: {
 }
 
 async function recordFailures(
+  motorId: number,
   reading: { corrente: number; temperatura: number; vibracao: number; rotacao: number },
   ranges: RangesMap,
   statuses: Record<VariableKey, Status>,
 ) {
   const rows = VARIABLES.filter((v) => statuses[v.key] !== 'normal').map((v) => ({
+    motorId,
     variable: v.key,
     value: reading[v.key],
     unit: v.unit,
@@ -49,37 +53,62 @@ async function recordFailures(
   }
 }
 
+/** Generates a new simulated reading for a motor if its latest one is stale. */
+async function tickMotor(motorId: number) {
+  const ranges = await getMotorRangesMap(motorId)
+  const [latest] = await db
+    .select()
+    .from(readings)
+    .where(eq(readings.motorId, motorId))
+    .orderBy(desc(readings.timestamp))
+    .limit(1)
+
+  const isStale = !latest || Date.now() - new Date(latest.timestamp).getTime() >= TICK_MS
+  if (!isStale) return ranges
+
+  const base = latest ?? initialReading(ranges)
+  const next = simulateNext(base, ranges)
+  const [inserted] = await db
+    .insert(readings)
+    .values({ ...next, motorId })
+    .returning()
+  await recordFailures(motorId, inserted, ranges, statusesFor(inserted, ranges))
+  return ranges
+}
+
 /**
- * Ensures there is a "fresh" (< 2s old) reading, generating one if the
- * latest reading is stale (or none exists yet), then returns the latest N
- * readings, the current ranges, and computed per-variable statuses.
+ * Ensures every motor has a "fresh" (< 2s old) reading, generating one if a
+ * motor's latest reading is stale (or none exists yet), then returns the
+ * latest N readings, the current ranges, and computed per-variable statuses
+ * for the requested motor.
  *
  * This is the single source of truth for the simulation — polled by the
  * dashboard every 2s from the client, so multiple tabs/users all see the
  * same server-generated data instead of racing independent client timers.
+ * All motors are ticked (not only the one being viewed) so failures and
+ * maintenance predictions keep accumulating for every motor.
  */
 export const getLatestState = createServerFn({ method: 'GET' })
-  .inputValidator((data: { limit?: number } | undefined) => data)
+  .inputValidator((data: { limit?: number; motorId?: number } | undefined) => data)
   .handler(async ({ data }) => {
-    const limit = data?.limit ?? 30
+    requireSession()
+    const limit = Math.min(Math.max(data?.limit ?? 30, 1), 500)
 
-    const ranges = await getRangesMap()
+    const allMotors = await db.select().from(motors).orderBy(asc(motors.id))
+    const motorId =
+      allMotors.find((m) => m.id === data?.motorId)?.id ?? allMotors[0]?.id ?? 1
 
-    const [latest] = await db.select().from(readings).orderBy(desc(readings.timestamp)).limit(1)
-
-    const isStale = !latest || Date.now() - new Date(latest.timestamp).getTime() >= TICK_MS
-
-    if (isStale) {
-      const base = latest ?? initialReading(ranges)
-      const next = simulateNext(base, ranges)
-      const [inserted] = await db.insert(readings).values(next).returning()
-      const statuses = statusesFor(inserted, ranges)
-      await recordFailures(inserted, ranges, statuses)
+    let ranges: RangesMap | null = null
+    for (const m of allMotors) {
+      const r = await tickMotor(m.id)
+      if (m.id === motorId) ranges = r
     }
+    if (!ranges) ranges = await tickMotor(motorId)
 
     const recent = await db
       .select()
       .from(readings)
+      .where(eq(readings.motorId, motorId))
       .orderBy(desc(readings.timestamp))
       .limit(limit)
 
@@ -88,6 +117,7 @@ export const getLatestState = createServerFn({ method: 'GET' })
     const statuses = current ? statusesFor(current, ranges) : null
 
     return {
+      motorId,
       readings: orderedAsc,
       ranges,
       statuses,
@@ -95,29 +125,75 @@ export const getLatestState = createServerFn({ method: 'GET' })
   })
 
 export const getAllReadings = createServerFn({ method: 'GET' }).handler(async () => {
+  requireSession()
   return db.select().from(readings).orderBy(desc(readings.timestamp))
 })
 
+export const clearReadings = createServerFn({ method: 'POST' })
+  .inputValidator(ClearSchema)
+  .handler(async ({ data }) => {
+    requireSuporte()
+    const removed = await clearRows(
+      { table: readings, id: readings.id, ts: readings.timestamp, motor: readings.motorId },
+      data,
+    )
+    return { removed }
+  })
+
 export const getFailures = createServerFn({ method: 'GET' }).handler(async () => {
+  requireSession()
   return db.select().from(failures).orderBy(desc(failures.timestamp))
 })
 
-export const getRanges = createServerFn({ method: 'GET' }).handler(async () => {
-  return getRangesMap()
-})
+export const clearFailures = createServerFn({ method: 'POST' })
+  .inputValidator(ClearSchema)
+  .handler(async ({ data }) => {
+    requireSuporte()
+    const removed = await clearRows(
+      { table: failures, id: failures.id, ts: failures.timestamp, motor: failures.motorId },
+      data,
+    )
+    return { removed }
+  })
+
+const MotorIdSchema = z.object({ motorId: z.number().int().positive() })
+
+export const getRanges = createServerFn({ method: 'GET' })
+  .inputValidator(MotorIdSchema)
+  .handler(async ({ data }) => {
+    requireSuporte()
+    return getMotorRangesMap(data.motorId)
+  })
+
+const RangeSchema = z.object({ min: z.number(), max: z.number(), attention: z.number() })
 
 const SaveRangesSchema = z.object({
-  corrente: z.object({ min: z.number(), max: z.number(), attention: z.number() }),
-  temperatura: z.object({ min: z.number(), max: z.number(), attention: z.number() }),
-  vibracao: z.object({ min: z.number(), max: z.number(), attention: z.number() }),
-  rotacao: z.object({ min: z.number(), max: z.number(), attention: z.number() }),
+  motorId: z.number().int().positive(),
+  ranges: z.object({
+    corrente: RangeSchema,
+    temperatura: RangeSchema,
+    vibracao: RangeSchema,
+    rotacao: RangeSchema,
+  }),
 })
+
+async function writeMotorRanges(motorId: number, values: RangesMap) {
+  await getMotorRangesMap(motorId) // make sure rows exist
+  for (const v of VARIABLES) {
+    const r = values[v.key]
+    await db
+      .update(motorRanges)
+      .set({ min: r.min, max: r.max, attentionBand: r.attention })
+      .where(and(eq(motorRanges.motorId, motorId), eq(motorRanges.variable, v.key)))
+  }
+}
 
 export const saveRanges = createServerFn({ method: 'POST' })
   .inputValidator(SaveRangesSchema)
   .handler(async ({ data }) => {
+    requireSuporte()
     for (const v of VARIABLES) {
-      const r = data[v.key]
+      const r = data.ranges[v.key]
       if (r.min >= r.max) {
         throw new Error(`${v.label}: o valor mínimo deve ser menor que o máximo.`)
       }
@@ -131,28 +207,30 @@ export const saveRanges = createServerFn({ method: 'POST' })
       }
     }
 
-    for (const v of VARIABLES) {
-      const r = data[v.key]
-      await db
-        .update(rangesTable)
-        .set({ min: r.min, max: r.max, attentionBand: r.attention })
-        .where(eq(rangesTable.variable, v.key))
-    }
-
-    return getRangesMap()
+    await writeMotorRanges(data.motorId, data.ranges)
+    return getMotorRangesMap(data.motorId)
   })
 
-export const restoreDefaultRanges = createServerFn({ method: 'POST' }).handler(async () => {
-  for (const v of VARIABLES) {
-    const r = DEFAULT_RANGES[v.key]
-    await db
-      .update(rangesTable)
-      .set({ min: r.min, max: r.max, attentionBand: r.attention })
-      .where(eq(rangesTable.variable, v.key))
-  }
-  return getRangesMap()
-})
+export const restoreDefaultRanges = createServerFn({ method: 'POST' })
+  .inputValidator(MotorIdSchema)
+  .handler(async ({ data }) => {
+    requireSuporte()
+    await writeMotorRanges(data.motorId, DEFAULT_RANGES)
+    return getMotorRangesMap(data.motorId)
+  })
 
 export const getAccessLogs = createServerFn({ method: 'GET' }).handler(async () => {
+  requireSuporte()
   return db.select().from(accessLogs).orderBy(desc(accessLogs.timestamp))
 })
+
+export const clearAccessLogs = createServerFn({ method: 'POST' })
+  .inputValidator(ClearSchema)
+  .handler(async ({ data }) => {
+    requireSuporte()
+    const removed = await clearRows(
+      { table: accessLogs, id: accessLogs.id, ts: accessLogs.timestamp },
+      data,
+    )
+    return { removed }
+  })

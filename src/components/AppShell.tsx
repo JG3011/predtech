@@ -1,22 +1,24 @@
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
+  CalendarClock,
   Gauge,
   LayoutDashboard,
   ListTree,
   LogOut,
   Menu,
   ShieldCheck,
+  Wrench,
   Sliders,
   X,
 } from 'lucide-react'
-import { logout } from '../server/auth.functions.js'
+import { logPageVisit, logout } from '../server/auth.functions.js'
 import type { Role } from '../server/auth.server.js'
 
 const NAV_ITEMS: Array<{
-  to: '/' | '/falhas' | '/leituras' | '/range' | '/acessos'
+  to: '/' | '/falhas' | '/leituras' | '/manutencao' | '/manutencoes' | '/range' | '/acessos'
   label: string
   icon: typeof LayoutDashboard
   roles: Role[]
@@ -24,6 +26,8 @@ const NAV_ITEMS: Array<{
   { to: '/', label: 'Dashboard', icon: LayoutDashboard, roles: ['operador', 'suporte'] },
   { to: '/falhas', label: 'Histórico de Falhas', icon: AlertTriangle, roles: ['operador', 'suporte'] },
   { to: '/leituras', label: 'Histórico de Leituras', icon: ListTree, roles: ['operador', 'suporte'] },
+  { to: '/manutencao', label: 'Previsão de Manutenção', icon: CalendarClock, roles: ['operador', 'suporte'] },
+  { to: '/manutencoes', label: 'Histórico de Manutenções', icon: Wrench, roles: ['suporte'] },
   { to: '/range', label: 'Range', icon: Sliders, roles: ['suporte'] },
   { to: '/acessos', label: 'Histórico de Entradas', icon: ShieldCheck, roles: ['suporte'] },
 ]
@@ -38,6 +42,11 @@ export function AppShell({
   const [open, setOpen] = useState(false)
   const navigate = useNavigate()
   const pathname = useRouterState({ select: (s) => s.location.pathname })
+
+  // Record every screen (aba) opened, shown in Histórico de Entradas.
+  useEffect(() => {
+    logPageVisit({ data: { page: pathname } }).catch(() => {})
+  }, [pathname])
 
   async function handleLogout() {
     await logout()
